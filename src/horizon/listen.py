@@ -2,11 +2,14 @@ import socket
 from os import kill, getpid
 from Queue import Full
 from multiprocessing import Process
-from struct import Struct, unpack
+from struct import Struct, unpack, calcsize
 from msgpack import unpackb
 
 import logging
 import settings
+
+import trollius
+from trollius import From
 
 logger = logging.getLogger("HorizonLog")
 
@@ -128,50 +131,48 @@ class Listen(Process):
         """
         Listen for pickles over tcp
         """
-        while 1:
-            try:
-                # Set up the TCP listening socket
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind((self.ip, self.port))
-                s.setblocking(1)
-                s.listen(5)
-                logger.info('listening over tcp for pickles on %s' % self.port)
+        @trollius.coroutine
+        def handle_pickles(reader, writer):
+            chunk = []
+            while True:
+                self.check_if_parent_is_alive()
+                try:
+                    header = yield From(reader.readexactly(calcsize('!I')))
+                    length, = Struct('!I').unpack(header)
+                    body = yield From(reader.readexactly(length))
 
-                (conn, address) = s.accept()
-                logger.info('connection from %s:%s' % (address[0], self.port))
+                    # Iterate and chunk each individual datapoint
+                    for bunch in self.gen_unpickle(body):
+                        for metric in bunch:
+                            chunk.append(metric)
 
-                chunk = []
-                while 1:
-                    self.check_if_parent_is_alive()
-                    try:
-                        length = Struct('!I').unpack(self.read_all(conn, 4))
-                        body = self.read_all(conn, length[0])
+                            # Queue the chunk and empty the variable
+                            if len(chunk) > settings.CHUNK_SIZE:
+                                try:
+                                    self.q.put(list(chunk), block=False)
+                                    chunk[:] = []
 
-                        # Iterate and chunk each individual datapoint
-                        for bunch in self.gen_unpickle(body):
-                            for metric in bunch:
-                                chunk.append(metric)
+                                # Drop chunk if queue is full
+                                except Full:
+                                    logger.info('queue is full, dropping datapoints')
+                                    chunk[:] = []
 
-                                # Queue the chunk and empty the variable
-                                if len(chunk) > settings.CHUNK_SIZE:
-                                    try:
-                                        self.q.put(list(chunk), block=False)
-                                        chunk[:] = []
+                except Exception as e:
+                    logger.exception('Processing metrics')
+                    raise
 
-                                    # Drop chunk if queue is full
-                                    except Full:
-                                        logger.info('queue is full, dropping datapoints')
-                                        chunk[:] = []
+        loop = trollius.get_event_loop()
+        server = loop.run_until_complete(trollius.start_server(handle_pickles,
+                    self.ip, self.port, loop=loop))
+        try:
+            loop.run_forever()
+        except KeyboardInterrupt:
+            pass
 
-                    except Exception as e:
-                        logger.info(e)
-                        logger.info('incoming connection dropped, attempting to reconnect')
-                        break
-
-            except Exception as e:
-                logger.info('can\'t connect to socket: ' + str(e))
-                break
+        # Close the server
+        server.close()
+        loop.run_until_complete(server.wait_closed())
+        loop.close()
 
     def listen_udp(self):
         """
